@@ -1,5 +1,6 @@
 using Comfort.Common;
 using EFT;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -11,113 +12,100 @@ namespace Mass.Radar
     public class RadarController : MonoBehaviour
     {
         [SerializeField]
-        private Image radarback;
+        private float MaxRadarDistance = 60f;
+        [SerializeField]
+        private float ScanInterval = 0.25f;
 
         [SerializeField]
-        private Image enemy01;
+        private Image radarback = null;
 
         [SerializeField]
-        private Image enemy02;
+        private RectTransform markerContainer = null;
 
         [SerializeField]
-        private Image enemy03;
+        private Image markerTemplate = null;
 
         [SerializeField]
-        private Image enemy04;
+        [Min(1)]
+        private int maxMarkerCount = 32;
 
-        [SerializeField]
-        private Image enemy05;
-
-        [SerializeField]
-        private Image enemy06;
-
-        [SerializeField]
-        private Image enemy07;
-
-        [SerializeField]
-        private Image enemy08;
-
-        [SerializeField]
-        private Image enemy09;
-
-        [SerializeField]
-        private Image enemy10;
-
-        [SerializeField]
-        private float maxScanDistance = 60f;
-
-        private const float ScanInterval = 0.25f;
-
-        private static GameWorld gameWorld;
-        private Image[] enemyImages;
-        private RectTransform[] enemyMarkers;
-        private RectTransform radarBackRect;
+        private GameWorld gameWorld;
+        private readonly List<RectTransform> markerPool = new List<RectTransform>();
+        private RectTransform radarRectTransform;
+        private float markerHalfWidth;
+        private float markerHalfHeight;
         private float nextScanTime;
-
-        private static bool Entermap()
-        {
-            return Singleton<GameWorld>.Instantiated;
-        }
 
         private void OnEnable()
         {
-            CacheUiReferences();
-            if (!ValidateUiReferences())
+            gameWorld = Singleton<GameWorld>.Instantiated
+                ? Singleton<GameWorld>.Instance
+                : null;
+
+            if (!TryCacheUiReferences())
             {
                 enabled = false;
                 return;
             }
 
-            gameWorld = Entermap() ? Singleton<GameWorld>.Instance : null;
-            nextScanTime = Time.unscaledTime;
-            HideAllMarkers();
+            nextScanTime = 0f;
+            HideMarkersFrom(0);
         }
 
         private void OnDisable()
         {
-            HideAllMarkers();
             gameWorld = null;
         }
 
         private void Update()
         {
-            if (gameWorld == null || Time.unscaledTime < nextScanTime)
+            if (Time.unscaledTime < nextScanTime)
             {
                 return;
             }
 
             nextScanTime = Time.unscaledTime + ScanInterval;
-            ScanRadar();
+            RefreshRadar();
         }
 
-        private void ScanRadar()
+        private void RefreshRadar()
         {
+            if (gameWorld == null)
+            {
+                HideMarkersFrom(0);
+                return;
+            }
+
             Player mainPlayer = gameWorld.MainPlayer;
             if (mainPlayer == null)
             {
-                HideAllMarkers();
+                HideMarkersFrom(0);
                 return;
             }
 
             Transform playerTransform = mainPlayer.Transform.Original;
-            radarBackRect.eulerAngles = new Vector3(
-                transform.eulerAngles.x,
-                transform.eulerAngles.y,
-                playerTransform.eulerAngles.y + 180f);
+            radarRectTransform.localEulerAngles = Vector3.zero;
 
-            HideAllMarkers();
-
-            float radarRadius = Mathf.Min(radarBackRect.rect.width, radarBackRect.rect.height) * 0.5f;
-            if (radarRadius <= 0f || maxScanDistance <= 0f)
+            float halfWidth = radarRectTransform.rect.width * 0.5f;
+            float height = radarRectTransform.rect.height;
+            float horizontalRadius = Mathf.Max(0f, halfWidth - markerHalfWidth);
+            float verticalRadius = Mathf.Max(0f, height - markerHalfHeight * 2f);
+            float radarRadius = Mathf.Min(horizontalRadius, verticalRadius);
+            float maxDistanceSquared = MaxRadarDistance * MaxRadarDistance;
+            Vector3 radarForward = mainPlayer.LookDirection;
+            radarForward.y = 0f;
+            if (radarForward.sqrMagnitude <= Mathf.Epsilon)
             {
+                HideMarkersFrom(0);
                 return;
             }
 
-            float maxDistanceSquared = maxScanDistance * maxScanDistance;
+            radarForward.Normalize();
+            Vector3 radarRight = Vector3.Cross(Vector3.up, radarForward);
             int markerIndex = 0;
             var registeredPlayers = gameWorld.RegisteredPlayers;
 
-            for (int i = 0; i < registeredPlayers.Count && markerIndex < enemyMarkers.Length; i++)
+            for (int i = 0; i < registeredPlayers.Count && markerIndex < maxMarkerCount; i++)
             {
                 IPlayer currentPlayer = registeredPlayers[i];
                 if (currentPlayer == null || ReferenceEquals(currentPlayer, mainPlayer))
@@ -126,76 +114,80 @@ namespace Mass.Radar
                 }
 
                 Vector3 offset = currentPlayer.Position - playerTransform.position;
-                Vector2 planarOffset = new Vector2(offset.x, offset.z);
-                if (planarOffset.sqrMagnitude > maxDistanceSquared)
+                offset.y = 0f;
+                float forwardDistance = Vector3.Dot(offset, radarForward);
+                if (forwardDistance <= 0f || offset.sqrMagnitude > maxDistanceSquared)
                 {
                     continue;
                 }
 
-                RectTransform marker = enemyMarkers[markerIndex];
-                marker.anchoredPosition = -planarOffset * (radarRadius / maxScanDistance);
-                marker.gameObject.SetActive(true);
+                float rightDistance = Vector3.Dot(offset, radarRight);
+                float markerX = rightDistance / MaxRadarDistance * radarRadius;
+                float markerY = markerHalfHeight + forwardDistance / MaxRadarDistance * radarRadius;
+
+                RectTransform markerRectTransform = GetOrCreateMarker(markerIndex);
+                markerRectTransform.gameObject.SetActive(true);
+                markerRectTransform.anchoredPosition = new Vector2(
+                    Mathf.Clamp(markerX, -horizontalRadius, horizontalRadius),
+                    Mathf.Clamp(markerY, markerHalfHeight, height - markerHalfHeight));
                 markerIndex++;
             }
+
+            HideMarkersFrom(markerIndex);
         }
 
-        private void CacheUiReferences()
+        private bool TryCacheUiReferences()
         {
-            enemyImages = new[]
-            {
-                enemy01,
-                enemy02,
-                enemy03,
-                enemy04,
-                enemy05,
-                enemy06,
-                enemy07,
-                enemy08,
-                enemy09,
-                enemy10
-            };
-
-            radarBackRect = radarback != null ? radarback.rectTransform : null;
-            enemyMarkers = new RectTransform[enemyImages.Length];
-            for (int i = 0; i < enemyImages.Length; i++)
-            {
-                enemyMarkers[i] = enemyImages[i] != null ? enemyImages[i].rectTransform : null;
-            }
-        }
-
-        private bool ValidateUiReferences()
-        {
-            if (radarBackRect == null)
+            if (radarback == null)
             {
                 Debug.LogError("[Mass.Radar] Radar background is not assigned.", this);
                 return false;
             }
 
-            for (int i = 0; i < enemyMarkers.Length; i++)
+            if (markerContainer == null)
             {
-                if (enemyMarkers[i] == null)
-                {
-                    Debug.LogError($"[Mass.Radar] Enemy marker {i + 1} is not assigned.", this);
-                    return false;
-                }
+                Debug.LogError("[Mass.Radar] Marker container is not assigned.", this);
+                return false;
             }
 
+            if (markerTemplate == null)
+            {
+                Debug.LogError("[Mass.Radar] Marker template is not assigned.", this);
+                return false;
+            }
+
+            if (maxMarkerCount < 1)
+            {
+                Debug.LogError("[Mass.Radar] Max marker count must be at least 1.", this);
+                return false;
+            }
+
+            radarRectTransform = radarback.rectTransform;
+            Rect markerRect = markerTemplate.rectTransform.rect;
+            markerHalfWidth = Mathf.Abs(markerRect.width) * 0.5f;
+            markerHalfHeight = Mathf.Abs(markerRect.height) * 0.5f;
+            markerTemplate.gameObject.SetActive(false);
             return true;
         }
 
-        private void HideAllMarkers()
+        private RectTransform GetOrCreateMarker(int index)
         {
-            if (enemyMarkers == null)
+            while (markerPool.Count <= index)
             {
-                return;
+                Image marker = Instantiate(markerTemplate, markerContainer, false);
+                marker.name = $"RadarMarker_{markerPool.Count + 1:D2}";
+                marker.gameObject.SetActive(false);
+                markerPool.Add(marker.rectTransform);
             }
 
-            for (int i = 0; i < enemyMarkers.Length; i++)
+            return markerPool[index];
+        }
+
+        private void HideMarkersFrom(int firstUnusedIndex)
+        {
+            for (int i = firstUnusedIndex; i < markerPool.Count; i++)
             {
-                if (enemyMarkers[i] != null)
-                {
-                    enemyMarkers[i].gameObject.SetActive(false);
-                }
+                markerPool[i].gameObject.SetActive(false);
             }
         }
     }
